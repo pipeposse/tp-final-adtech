@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+env/
+.env
+
+# Docker
+*.log
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Airflow
+logs/
+airflow.db
+airflow.cfg
+
+# Datos crudos (no van al repo)
+*.csv
+data/
+
+# Credenciales
+*.json
+!package.json
+key.json
+service-account*.json
