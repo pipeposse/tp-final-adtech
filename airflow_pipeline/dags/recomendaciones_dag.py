@@ -1,16 +1,27 @@
 """
 TP Final AdTech - DAG de recomendaciones diarias.
 
-Pipeline:
-    FiltrarDatos -> [TopCTR, TopProduct] -> DBWriting
+Cada DAG run procesa los datos de su `logical_date` (Airflow context["ds"]):
+    FiltrarDatos(ds) -> [TopCTR(ds), TopProduct(ds)] -> DBWriting(ds)
+
+Los CSVs vienen ya particionados por día:
+    ads_views_YYYY-MM-DD.csv
+    product_views_YYYY-MM-DD.csv
+    active_advertisers.csv  (no particionado)
+
+Las tablas finales en recos_db se reescriben con el resultado del último run.
 """
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from datetime import datetime, date
+from datetime import datetime
 import pandas as pd
 from sqlalchemy import create_engine
 import os
+
+# ---------------------------------------------------------------------------
+# Configuración
+# ---------------------------------------------------------------------------
 
 POSTGRES_URI = os.getenv("POSTGRES_URI")
 
@@ -23,42 +34,33 @@ if not POSTGRES_URI:
 BASE_PATH = "/home/pipeposse/trabajo_practico"
 
 
-def filtrar_datos(**context):
-    hoy = str(date.today())
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
 
-    active_advertisers = pd.read_csv(f"{BASE_PATH}/advertiser_ids.csv")
-    log_product_views = pd.read_csv(f"{BASE_PATH}/product_views.csv")
-    log_ads_views = pd.read_csv(f"{BASE_PATH}/ads_views.csv")
+def filtrar_datos(ds, **context):
+    """Lee los CSVs del día `ds` y filtra solo advertisers activos.
+    Guarda intermedios en /tmp para que las tasks siguientes los lean."""
+    active_advertisers = pd.read_csv(f"{BASE_PATH}/active_advertisers.csv")
+    log_ads_views = pd.read_csv(f"{BASE_PATH}/ads_views_{ds}.csv")
+    log_product_views = pd.read_csv(f"{BASE_PATH}/product_views_{ds}.csv")
 
-    log_product_views["date"] = log_product_views["date"].astype(str)
-    log_ads_views["date"] = log_ads_views["date"].astype(str)
+    activos = active_advertisers["advertiser_id"]
 
+    ads_views_filtrado = log_ads_views[log_ads_views["advertiser_id"].isin(activos)]
     product_views_filtrado = log_product_views[
-        log_product_views["date"].str.startswith(hoy)
-    ]
-    product_views_filtrado = product_views_filtrado[
-        product_views_filtrado["advertiser_id"].isin(
-            active_advertisers["advertiser_id"]
-        )
+        log_product_views["advertiser_id"].isin(activos)
     ]
 
-    ads_views_filtrado = log_ads_views[
-        log_ads_views["date"].str.startswith(hoy)
-    ]
-    ads_views_filtrado = ads_views_filtrado[
-        ads_views_filtrado["advertiser_id"].isin(
-            active_advertisers["advertiser_id"]
-        )
-    ]
-
-    product_views_filtrado.to_csv("/tmp/filtered_product_views.csv", index=False)
     ads_views_filtrado.to_csv("/tmp/filtered_ads_views.csv", index=False)
+    product_views_filtrado.to_csv("/tmp/filtered_product_views.csv", index=False)
 
-    print(f"Product views filtrados: {len(product_views_filtrado)}")
-    print(f"Ads views filtrados: {len(ads_views_filtrado)}")
+    print(f"[ds={ds}] ads_views filtrados: {len(ads_views_filtrado)}")
+    print(f"[ds={ds}] product_views filtrados: {len(product_views_filtrado)}")
 
 
-def top_ctr(**context):
+def top_ctr(ds, **context):
+    """Top 20 productos por advertiser ordenados por CTR (clicks/impresiones)."""
     log_ads = pd.read_csv("/tmp/filtered_ads_views.csv")
 
     clicks = (
@@ -67,7 +69,6 @@ def top_ctr(**context):
         .size()
         .reset_index(name="clicks_count")
     )
-
     impressions = (
         log_ads[log_ads["type"] == "impression"]
         .groupby(["advertiser_id", "product_id"])
@@ -77,13 +78,12 @@ def top_ctr(**context):
 
     counts = pd.merge(
         clicks, impressions,
-        on=["advertiser_id", "product_id"],
-        how="outer",
+        on=["advertiser_id", "product_id"], how="outer",
     ).fillna(0)
 
     counts["ctr"] = counts.apply(
-        lambda row: row["clicks_count"] / row["impressions_count"]
-        if row["impressions_count"] > 0 else 0,
+        lambda r: r["clicks_count"] / r["impressions_count"]
+        if r["impressions_count"] > 0 else 0,
         axis=1,
     )
 
@@ -95,12 +95,14 @@ def top_ctr(**context):
         .apply(list)
         .reset_index(name="top_products")
     )
+    top_ctr_df["date"] = ds
 
     top_ctr_df.to_csv("/tmp/top_product_CTR.csv", index=False)
-    print(f"TopCTR generado: {len(top_ctr_df)} advertisers")
+    print(f"[ds={ds}] TopCTR generado: {len(top_ctr_df)} advertisers")
 
 
-def top_product(**context):
+def top_product(ds, **context):
+    """Top 20 productos por advertiser ordenados por cantidad de views."""
     log_product_views = pd.read_csv("/tmp/filtered_product_views.csv")
 
     counts = (
@@ -118,12 +120,14 @@ def top_product(**context):
         .apply(list)
         .reset_index(name="top_products")
     )
+    top_product_df["date"] = ds
 
     top_product_df.to_csv("/tmp/top_product_VIEW.csv", index=False)
-    print(f"TopProduct generado: {len(top_product_df)} advertisers")
+    print(f"[ds={ds}] TopProduct generado: {len(top_product_df)} advertisers")
 
 
-def db_writing(**context):
+def db_writing(ds, **context):
+    """Vuelca los dos rankings a Postgres (Cloud SQL)."""
     engine = create_engine(POSTGRES_URI)
 
     df_ctr = pd.read_csv("/tmp/top_product_CTR.csv")
@@ -132,13 +136,17 @@ def db_writing(**context):
     df_ctr.to_sql("top_ctr", engine, if_exists="replace", index=False)
     df_product.to_sql("top_product", engine, if_exists="replace", index=False)
 
-    print("Tablas top_ctr y top_product escritas en recos_db")
+    print(f"[ds={ds}] tablas top_ctr y top_product reescritas en recos_db")
 
+
+# ---------------------------------------------------------------------------
+# DAG
+# ---------------------------------------------------------------------------
 
 with DAG(
     dag_id="adtech_pipeline",
     description="TP Final - Recomendaciones diarias TopCTR + TopProduct",
-    start_date=datetime(2026, 4, 28),
+    start_date=datetime(2026, 4, 18),
     schedule="@daily",
     catchup=False,
     tags=["tp-final", "adtech"],
