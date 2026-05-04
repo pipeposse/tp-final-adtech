@@ -33,7 +33,7 @@ Importante: la guía describe el sistema **tal como está implementado hoy**, co
 
 # 0. Antes de arrancar
 
-## ¿Qué carajos es este sistema?
+## ¿Qué es este sistema?
 
 Un sistema de recomendación de productos para anunciantes. La idea, en cuatro líneas:
 
@@ -86,7 +86,7 @@ Los archivos viven en **Google Cloud Storage** (GCS, una carpeta gigante en la n
 
 ## ¿Qué hay que saber antes de meterse?
 
-Cosas que ASUMIMOS que ya manejás (al menos un poquito). Si alguna no la tenés, parate 20 minutos y repasala antes de arrancar.
+Cosas que ASUMIMOS que ya manejamos (al menos un poquito).
 
 - **Linux básico**: moverte por la terminal, `cd`, `ls`, editar archivos con `nano`.
 - **Python**: qué es un `venv`, `pip install`, escribir un script.
@@ -97,7 +97,7 @@ Cosas que ASUMIMOS que ya manejás (al menos un poquito). Si alguna no la tenés
 
 ## Tip almacenero
 
-No intentes hacer todo de una. Resolvé una fase, dejala andando, y recién pasá a la siguiente. Si arrancás a escribir el DAG antes de tener Cloud SQL listo, vas a sufrir el doble.
+No intentear hacer todo de una. Resolvé una fase, dejala andando, y recién pasá a la siguiente. Si arrancás a escribir el DAG antes de tener Cloud SQL listo, vas a sufrir el doble.
 
 ---
 
@@ -105,7 +105,7 @@ No intentes hacer todo de una. Resolvé una fase, dejala andando, y recién pas�
 
 ## 1.1 Tener una cuenta
 
-Andá a https://console.cloud.google.com con tu cuenta de Google. La primera vez te pide activar facturación: **Google te regala 300 USD de crédito gratis**, sobra para todo el TP. Pero hay que cargar una tarjeta. No te van a cobrar hasta que se acaben los créditos.
+Vamos a https://console.cloud.google.com con tu cuenta de Google.
 
 ## 1.2 Crear el proyecto
 
@@ -121,7 +121,7 @@ Organización:     "Sin organización" si es cuenta personal
 
 ## 1.3 Habilitar las APIs que vamos a usar
 
-GCP es como un super: tiene cientos de servicios pero por defecto vienen apagados. Hay que prender los que vamos a usar.
+GCP es como un mercadito: tiene cientos de servicios pero por defecto vienen apagados. Hay que prender los que vamos a usar.
 
 Por consola web: Menú ≡ → **APIs y servicios** → **Biblioteca**. Buscá y habilitá uno por uno:
 
@@ -145,7 +145,7 @@ gcloud services enable \
 
 ## 1.4 Una sola región para todo
 
-Mezclar regiones genera tráfico inter-región pago y latencias raras. Elegí UNA y pegate ahí.
+Mezclar regiones=problemas futuros
 
 Nosotros usamos **`us-central1`** (Iowa). Es de las más baratas y tiene todos los servicios.
 
@@ -229,7 +229,7 @@ Machine type:       db-f1-micro o db-g1-small
 Storage:            10 GB SSD
 ```
 
-En **Connections**: marcá **Public IP**. Authorized networks vacío por ahora; después agregás IPs cuando hagan falta.
+En **Connections**: marcamos **Public IP**. Authorized networks vacío por ahora; después agregás IPs cuando hagan falta.
 
 Click **CREATE INSTANCE** y a esperar.
 
@@ -252,7 +252,6 @@ airflow_db   ← metadata interna de Airflow (DAGs, runs, logs)
 recos_db     ← tablas del proyecto (top_ctr, top_product, api_logs)
 ```
 
-**¿Por qué dos?** Si las mezcláramos, una migración interna de Airflow podría tocar las tablas del TP. Y los backups específicos serían más complicados.
 
 Por consola: dentro de la instancia → **Databases** → **CREATE DATABASE**. Repetir para la otra.
 
