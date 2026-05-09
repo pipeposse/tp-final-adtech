@@ -1,6 +1,5 @@
 """
 AdTech Recommendations API.
-
 Endpoints (alineados con el enunciado):
   GET /                                  -> health-style root
   GET /health                            -> health check
@@ -8,11 +7,12 @@ Endpoints (alineados con el enunciado):
   GET /history/{advertiser_id}/          -> recos de los últimos 7 días
   GET /stats/                            -> estadísticas agregadas
 
-Backend: psycopg2 directo (sin SQLAlchemy).
+Backend: psycopg2 directo. Lee de la tabla normalizada `recommendations`
+(una fila por (advertiser_id, model, product_id, date)). La tabla
+`api_logs` la sigue creando esta API en el lifespan startup.
 """
-
-import ast
 import os
+from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
 from datetime import date, timedelta
 
@@ -31,7 +31,9 @@ if POSTGRES_URI.startswith("postgresql+psycopg2://"):
         "postgresql+psycopg2://", "postgresql://", 1
     )
 
-MODEL_TABLE_MAP = {
+# Mapping del nombre PascalCase que llega por path al valor almacenado en
+# la columna `recommendations.model` (snake_case lowercase).
+MODEL_DB_MAP = {
     "TopCTR": "top_ctr",
     "TopProduct": "top_product",
 }
@@ -48,19 +50,6 @@ def get_conn():
         raise
     finally:
         conn.close()
-
-
-def _parse_products(raw):
-    if raw is None:
-        return []
-    if isinstance(raw, list):
-        return raw
-    if isinstance(raw, str):
-        try:
-            return ast.literal_eval(raw)
-        except Exception:
-            return [raw]
-    return [raw]
 
 
 def create_logs_table():
@@ -106,25 +95,30 @@ def get_recommendations(
     advertiser_id: str = Path(..., description="ID del advertiser"),
     modelo: str = Path(..., description="TopCTR o TopProduct"),
 ):
-    if modelo not in MODEL_TABLE_MAP:
+    if modelo not in MODEL_DB_MAP:
         raise HTTPException(
             status_code=400,
-            detail=f"Modelo invalido: '{modelo}'. Opciones: {list(MODEL_TABLE_MAP.keys())}",
+            detail=f"Modelo invalido: '{modelo}'. Opciones: {list(MODEL_DB_MAP.keys())}",
         )
-    table = MODEL_TABLE_MAP[modelo]
+    db_model = MODEL_DB_MAP[modelo]
 
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # "Dame los 20 productos mas recientes para ese advertiser+modelo,
+            # ordenados por fecha DESC y luego por rank."
             cur.execute(
-                f"SELECT advertiser_id, top_products, date "
-                f"FROM {table} "
-                f"WHERE advertiser_id = %s "
-                f"ORDER BY date DESC LIMIT 1",
-                (advertiser_id,),
+                """
+                SELECT product_id, date
+                FROM recommendations
+                WHERE advertiser_id = %s AND model = %s
+                ORDER BY date DESC, rank
+                LIMIT 20
+                """,
+                (advertiser_id, db_model),
             )
-            row = cur.fetchone()
+            rows = cur.fetchall()
 
-    if row is None:
+    if not rows:
         raise HTTPException(
             status_code=404,
             detail=f"No hay recomendaciones para advertiser '{advertiser_id}' con modelo '{modelo}'.",
@@ -141,34 +135,41 @@ def get_recommendations(
         print(f"Warning: no se pudo loguear consulta: {e}")
 
     return {
-        "advertiser_id": row["advertiser_id"],
+        "advertiser_id": advertiser_id,
         "model": modelo,
-        "date": row["date"],
-        "recommendations": _parse_products(row["top_products"]),
+        "date": rows[0]["date"].isoformat(),
+        "recommendations": [r["product_id"] for r in rows],
     }
 
 
 @app.get("/history/{advertiser_id}/")
 def get_history(advertiser_id: str = Path(...)):
-    cutoff = (date.today() - timedelta(days=7)).isoformat()
+    cutoff = date.today() - timedelta(days=7)
     history = {"TopCTR": [], "TopProduct": []}
 
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            for modelo, table in MODEL_TABLE_MAP.items():
+            for modelo, db_model in MODEL_DB_MAP.items():
+                # "Dame todos los productos de ese advertiser+modelo desde
+                # el cutoff (hoy - 7 dias) hasta hoy, ordenados."
                 cur.execute(
-                    f"SELECT advertiser_id, top_products, date "
-                    f"FROM {table} "
-                    f"WHERE advertiser_id = %s AND date >= %s "
-                    f"ORDER BY date DESC",
-                    (advertiser_id, cutoff),
+                    """
+                    SELECT date, product_id
+                    FROM recommendations
+                    WHERE advertiser_id = %s
+                      AND model = %s
+                      AND date >= %s
+                    ORDER BY date DESC, rank
+                    """,
+                    (advertiser_id, db_model, cutoff),
                 )
+                # Agrupar las filas por fecha (una fila por producto).
+                grouped = {}
+                for r in cur.fetchall():
+                    grouped.setdefault(r["date"], []).append(r["product_id"])
                 history[modelo] = [
-                    {
-                        "date": r["date"],
-                        "recommendations": _parse_products(r["top_products"]),
-                    }
-                    for r in cur.fetchall()
+                    {"date": d.isoformat(), "recommendations": products}
+                    for d, products in grouped.items()
                 ]
 
     if not history["TopCTR"] and not history["TopProduct"]:
@@ -176,16 +177,15 @@ def get_history(advertiser_id: str = Path(...)):
             status_code=404,
             detail=f"No hay historial para advertiser '{advertiser_id}'.",
         )
-
     return {"advertiser_id": advertiser_id, "history": history}
 
 
 @app.get("/stats/")
 def get_stats():
     out = {}
-
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Consultas registradas, agrupadas por dia.
             cur.execute(
                 """
                 SELECT date,
@@ -198,33 +198,46 @@ def get_stats():
             )
             out["consultas_por_dia"] = [dict(r) for r in cur.fetchall()]
 
-            cur.execute("SELECT COUNT(DISTINCT advertiser_id) AS n FROM top_ctr")
+            # Cuantos advertisers distintos tiene cada modelo.
+            cur.execute(
+                "SELECT COUNT(DISTINCT advertiser_id) AS n "
+                "FROM recommendations WHERE model = 'top_ctr'"
+            )
             out["advertisers_top_ctr"] = cur.fetchone()["n"]
-            cur.execute("SELECT COUNT(DISTINCT advertiser_id) AS n FROM top_product")
-            out["advertisers_top_product"] = cur.fetchone()["n"]
 
             cur.execute(
+                "SELECT COUNT(DISTINCT advertiser_id) AS n "
+                "FROM recommendations WHERE model = 'top_product'"
+            )
+            out["advertisers_top_product"] = cur.fetchone()["n"]
+
+            # Para Jaccard: traemos todas las filas del dia mas reciente.
+            # La subquery devuelve UNA fecha (la mas nueva de toda la tabla).
+            cur.execute(
                 """
-                SELECT c.advertiser_id,
-                       c.top_products AS ctr_products,
-                       p.top_products AS product_products
-                FROM top_ctr c
-                JOIN top_product p ON c.advertiser_id = p.advertiser_id
+                SELECT advertiser_id, model, product_id
+                FROM recommendations
+                WHERE date = (SELECT MAX(date) FROM recommendations)
                 """
             )
             rows = cur.fetchall()
 
-    coincidencias = []
+    # Agrupar productos por (advertiser, modelo) en sets.
+    productos = defaultdict(lambda: {"top_ctr": set(), "top_product": set()})
     for r in rows:
-        ctr_set = set(_parse_products(r["ctr_products"]))
-        prod_set = set(_parse_products(r["product_products"]))
+        productos[r["advertiser_id"]][r["model"]].add(r["product_id"])
+
+    coincidencias = []
+    for advertiser_id, modelos in productos.items():
+        ctr_set = modelos["top_ctr"]
+        prod_set = modelos["top_product"]
         if not ctr_set or not prod_set:
             continue
         overlap = len(ctr_set & prod_set)
         union = len(ctr_set | prod_set)
         coincidencias.append(
             {
-                "advertiser_id": r["advertiser_id"],
+                "advertiser_id": advertiser_id,
                 "productos_en_comun": overlap,
                 "jaccard": round(overlap / union, 3) if union else 0,
             }
@@ -234,5 +247,4 @@ def get_stats():
 
     if not out["consultas_por_dia"]:
         out["mensaje_consultas"] = "No hay consultas registradas aun."
-
     return out

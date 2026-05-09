@@ -143,8 +143,9 @@ def db_writing(ds, **context):
 # DAG
 # ---------------------------------------------------------------------------
 
-with DAG(
-    dag_id="adtech_pipeline",
+with 
+DAG(
+    dag_id="adtech_pipeline_v2_gcs",
     description="TP Final - Recomendaciones diarias TopCTR + TopProduct",
     start_date=datetime(2026, 4, 18),
     schedule="@daily",
