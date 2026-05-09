@@ -1,161 +1,213 @@
-# TP Final - AdTech Recommendations
+# TP Final — Pipeline de Recomendaciones AdTech
 
-Pipeline end-to-end de recomendacion de productos para advertisers, desplegado en Google Cloud Platform. Procesamiento diario de logs de impresiones y clicks, calculo de Top 20 productos por dos modelos (TopCTR y TopProduct), persistencia en PostgreSQL, y exposicion via API REST.
+**Materia:** Programación Avanzada · Universidad de San Andrés · 2026
+**Autores:** Felipe Posse · Diego Sanguinetti · Belén Candela Lozada Montanari
+**Profesores:** Agustín Mosteiro · Matías Dinota
+**Entrega:** 09/05/2026 · **Coloquio:** 13/05/2026
+
+Sistema completo de recomendaciones AdTech que ingesta CSVs diarios desde Cloud Storage, los procesa con Apache Airflow, calcula dos modelos de ranking (TopCTR y TopProduct) y los expone vía API REST en Cloud Run.
+
+---
+
+## Acceso rápido
+
+| Recurso | URL |
+|---|---|
+| API REST (Cloud Run) | https://fastapi-tp-xbo6kajhza-uc.a.run.app |
+| Documentación interactiva (Swagger) | https://fastapi-tp-xbo6kajhza-uc.a.run.app/docs |
+| Airflow UI | http://34.55.205.251:8080 (usuario: `profesor` / pass: `profesor`, rol Viewer) |
+| Informe técnico completo | [`docs/INFORME_FINAL.md`](docs/INFORME_FINAL.md) |
+
+---
 
 ## Arquitectura
 
 ```
-GCS bucket  (CSVs crudos diarios, en gs://tp-final-adtech/raw/)
-   |
-   v
-Compute Engine VM (e2-small, us-central1-a)
-  |-- Apache Airflow (scheduler + webserver)
-  |   \-- DAG adtech_pipeline (@daily)
-  |       |-- FiltrarDatos
-  |       |-- top_ctr
-  |       |-- top_product
-  |       \-- DBWriting
-  \-- Lee CSVs locales de /home/pipeposse/trabajo_practico/
-   |
-   v
-Cloud SQL (PostgreSQL 15)
-  |-- airflow_db   (metadata interna de Airflow)
-  \-- recos_db
-       |-- top_ctr      (resultado del ultimo run del DAG)
-       |-- top_product  (resultado del ultimo run del DAG)
-       \-- api_logs     (registro de consultas a la API)
-   ^
-   |
-FastAPI service (Cloud Run)
-   |
-   v
-Cliente HTTP (profesor / corrector)
+GCS (gs://tp-final-adtech/)
+        │
+        ▼
+Compute Engine VM (airflow-vm, e2-small, us-central1-a)
+   ├── Apache Airflow scheduler + webserver
+   └── DAG: adtech_pipeline_v2_gcs
+         FiltrarDatos → TopCTR + TopProduct → DBWriting
+                                                    │
+                                                    ▼
+                            Cloud SQL Postgres 18 (recos_db)
+                                ├── recommendations
+                                └── api_logs
+                                                    ▲
+                                                    │
+                            Cloud Run (fastapi-tp:v3)
+                                        ▲
+                                        │
+                                    Cliente HTTP
 ```
 
-## Modelos de recomendacion
+El DAG corre diariamente a las **02:00 UTC**. La API es stateless y autoescala con tráfico.
 
-- **TopCTR**: Top 20 productos por advertiser ordenados por click-through ratio (clicks/impresiones).
-- **TopProduct**: Top 20 productos por advertiser ordenados por cantidad de visualizaciones.
+---
 
-Solo se procesan los advertisers que aparecen en el dataset `active_advertisers` del dia.
+## Identificadores GCP
 
-## Accesos para evaluacion
-
-### API REST publica
-
-URL base: `https://fastapi-tp-xbo6kajhza-uc.a.run.app`
-
-| Endpoint | Descripcion |
+| Recurso | Valor |
 |---|---|
-| `GET /` | Status del servicio |
-| `GET /health` | Health check |
-| `GET /docs` | Documentacion interactiva (Swagger UI) |
-| `GET /recommendations/{advertiser_id}/{modelo}` | Ultima recomendacion para un advertiser. Modelos: `TopCTR`, `TopProduct`. |
-| `GET /history/{advertiser_id}/` | Recomendaciones disponibles, filtradas por ultimos 7 dias. Ver nota. |
-| `GET /stats/` | Estadisticas: consultas por dia, advertisers por modelo, similaridad Jaccard entre modelos. |
+| Project ID | `tp-final-adtech-493922` |
+| Region | `us-central1` |
+| Cloud SQL instance | `tp-final-adtech-493922` |
+| Postgres IP pública | `34.46.239.72` |
+| Bases en Cloud SQL | `airflow_db` (metadata Airflow) · `recos_db` (recomendaciones) |
+| Bucket de datos | `gs://tp-final-adtech/` |
+| VM Airflow | `airflow-vm` (zone `us-central1-a`, IP estática `34.55.205.251`) |
+| Artifact Registry repo | `tp-final-repo` (region `us-central1`) |
+| Imagen API activa | `us-central1-docker.pkg.dev/tp-final-adtech-493922/tp-final-repo/fastapi-tp:v3` |
+| Servicio Cloud Run | `fastapi-tp` |
 
-> **Nota sobre `/history/`**: la query SQL filtra por los ultimos 7 dias, pero en la implementacion actual el DAG sobreescribe las tablas en cada run (`if_exists="replace"`), por lo que la base contiene solo el dia mas reciente. El endpoint devuelve un dia. Esta limitacion esta documentada en el informe (seccion 9).
-
-Ejemplos:
-
-```bash
-curl https://fastapi-tp-xbo6kajhza-uc.a.run.app/health
-curl https://fastapi-tp-xbo6kajhza-uc.a.run.app/recommendations/LW045DVYSGRD75TK6U54/TopCTR
-curl https://fastapi-tp-xbo6kajhza-uc.a.run.app/history/LW045DVYSGRD75TK6U54/
-curl https://fastapi-tp-xbo6kajhza-uc.a.run.app/stats/
-```
-
-### Airflow UI
-
-URL: `http://34.55.205.251:8080`
-
-Credenciales de evaluacion (rol Viewer, solo lectura):
-
-```
-Usuario:  profesor
-Password: profesor
-```
-
-DAG principal: `adtech_pipeline`. Schedule: diario.
-
-## Stack tecnico
-
-| Capa | Tecnologia |
-|---|---|
-| Orquestacion | Apache Airflow 2.x con LocalExecutor |
-| Almacenamiento de datos | Cloud SQL (PostgreSQL 15) |
-| API | FastAPI 0.115 + Uvicorn + psycopg2-binary |
-| Containers | Docker, Cloud Build, Artifact Registry, Cloud Run |
-| Storage de archivos crudos | Google Cloud Storage |
-| Compute (Airflow) | Compute Engine VM (e2-small, us-central1-a) |
-| Driver de DB en el DAG | pandas + SQLAlchemy (via to_sql) |
-| Driver de DB en la API | psycopg2 directo |
+---
 
 ## Estructura del repositorio
 
 ```
-.
+tp-final-adtech/
 ├── airflow_pipeline/
-│   ├── dags/
-│   │   └── recomendaciones_dag.py
+│   ├── dags/recomendaciones_dag.py    # DAG adtech_pipeline_v2_gcs
+│   ├── utils/{gcs_io.py, db.py}        # Helpers de GCS y Postgres
 │   └── requirements.txt
 ├── api/
-│   ├── app/
-│   │   ├── __init__.py
-│   │   └── main.py             # endpoints
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   └── .dockerignore
-├── docs/
-│   └── informe.md              # informe completo en Markdown
+│   ├── app/main.py                     # FastAPI (psycopg2 directo)
+│   ├── Dockerfile                      # python:3.12-slim, uvicorn
+│   └── requirements.txt
 ├── sql/
-│   └── schema.sql              # esquema descriptivo de las tablas
-├── .gitignore
+│   └── schema.sql                      # Schema de recos_db
+├── docs/
+│   └── INFORME_FINAL.md                # Informe técnico del TP
 └── README.md
 ```
 
-## Variables de entorno
+---
 
-El servicio FastAPI requiere `POSTGRES_URI` para conectarse a la base. Formato:
+## Modelo de datos
 
+Schema final en `recos_db` (definido en [`sql/schema.sql`](sql/schema.sql)):
+
+```sql
+CREATE TABLE recommendations (
+    id            BIGSERIAL PRIMARY KEY,
+    advertiser_id VARCHAR(64)  NOT NULL,
+    model         VARCHAR(32)  NOT NULL,    -- 'top_ctr' | 'top_product'
+    product_id    VARCHAR(128) NOT NULL,
+    rank          INTEGER      NOT NULL,
+    score         NUMERIC(10,6),
+    date          DATE         NOT NULL,
+    created_at    TIMESTAMP    DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX uq_recommendations_natural_key
+    ON recommendations (advertiser_id, model, product_id, date);
 ```
-POSTGRES_URI=postgresql://USER:PASSWORD@HOST:PORT/DBNAME
-```
 
-(El codigo tambien acepta el formato extendido `postgresql+psycopg2://...` y lo normaliza al estandar libpq antes de pasarlo a psycopg2.)
+El índice único es necesario para que el DAG pueda hacer `INSERT ... ON CONFLICT ... DO UPDATE`. La tabla `api_logs` la crea la API automáticamente al arrancar.
 
-Las credenciales reales viven en Cloud Run environment variables y no estan commiteadas. El archivo `.env.example` documenta el formato esperado con un placeholder `TU_PASSWORD`.
+---
 
-## Despliegue
+## Endpoints de la API
 
-### API en Cloud Run
+| Método | Endpoint | Descripción |
+|---|---|---|
+| `GET` | `/health` | Health check sin tocar la base |
+| `GET` | `/recommendations/{advertiser_id}/{modelo}` | Top 20 productos del último día. `modelo` ∈ {`TopCTR`, `TopProduct`} |
+| `GET` | `/history/{advertiser_id}/` | Recomendaciones de los últimos 7 días, agrupadas por día |
+| `GET` | `/stats/` | Consultas por día, advertisers por modelo, similaridad Jaccard entre modelos |
+| `GET` | `/docs` | Swagger UI |
+
+Códigos HTTP: `200` OK · `400` modelo inválido · `404` advertiser sin datos · `500` error interno.
+
+### Ejemplos rápidos
 
 ```bash
-gcloud builds submit api/ \
-  --tag=us-central1-docker.pkg.dev/tp-final-adtech-493922/tp-final-repo/fastapi-tp:vN
+BASE=https://fastapi-tp-xbo6kajhza-uc.a.run.app
+ADV=OAGTYWN8WFC997VLDJH7   # advertiser con mayor Jaccard (0.333)
 
-gcloud run deploy fastapi-tp \
-  --image=us-central1-docker.pkg.dev/tp-final-adtech-493922/tp-final-repo/fastapi-tp:vN \
-  --region=us-central1
+curl -s $BASE/health
+curl -s $BASE/recommendations/$ADV/TopCTR
+curl -s $BASE/recommendations/$ADV/TopProduct
+curl -s $BASE/history/$ADV/
+curl -s $BASE/stats/
 ```
 
-### Airflow en VM
+---
 
-El DAG vive en `~/airflow/dags/recomendaciones_dag.py` dentro de la VM. El scheduler y webserver corren bajo el venv `~/airflow_venv/` con LocalExecutor contra `airflow_db` en Cloud SQL.
+## Cómo levantar todo desde cero
 
-## Limitaciones conocidas
+El walkthrough completo está en [`docs/INFORME_FINAL.md`](docs/INFORME_FINAL.md). Resumen operativo:
 
-Documentadas en detalle en `docs/informe.md` (seccion 9):
+### 1. Cloud SQL
 
-- Las tablas se reescriben en cada run del DAG (`if_exists="replace"`), por lo que `/history/` devuelve solo el ultimo dia.
-- TopCTR no aplica filtro de impresiones minimas; un producto con muestra chica puede tener CTR=1.0.
-- El DAG lee CSVs locales, no descarga directamente de GCS. Los archivos se bajan manualmente con `gsutil cp`.
-- El DAG usa SQLAlchemy via `pandas.to_sql`, mientras que la API usa psycopg2 directo. Asimetria heredada.
-- El scheduler de Airflow corre con `nohup`, no con systemd. No se reinicia automaticamente al boot de la VM.
+Crear la base `recos_db` y aplicar el schema:
 
-## Notas para la defensa
+```bash
+psql -h 34.46.239.72 -U postgres -d recos_db -f sql/schema.sql
+```
 
-- El pipeline esta versionado por dia: cada corrida del DAG procesa el `ds` correspondiente y escribe en las tablas con esa fecha como columna.
-- La API loguea cada consulta en `api_logs` para alimentar el endpoint `/stats/`.
-- El analisis de similaridad Jaccard en `/stats/` muestra cuanto se solapan los dos modelos a nivel de productos recomendados por advertiser. Los valores observados (0.053 a 0.212) confirman que los modelos capturan senales distintas.
-- La imagen Docker esta versionada por tag (v1, v2, ...) en Artifact Registry para permitir rollback.
+### 2. VM de Airflow
+
+SSH a `airflow-vm`, activar el venv y disparar el scheduler/webserver:
+
+```bash
+gcloud compute ssh airflow-vm --zone us-central1-a --project tp-final-adtech-493922
+source ~/airflow_venv/bin/activate
+
+# Asegurar la env var en la shell antes de lanzar:
+export POSTGRES_URI='postgresql+psycopg2://USER:PASS@34.46.239.72:5432/recos_db'
+
+nohup airflow scheduler  > ~/airflow/scheduler.log 2>&1 & disown
+nohup airflow webserver -p 8080 > ~/airflow/webserver.log 2>&1 & disown
+```
+
+### 3. API en Cloud Run
+
+Build de la imagen + deploy:
+
+```bash
+cd api/
+gcloud builds submit \
+  --tag us-central1-docker.pkg.dev/tp-final-adtech-493922/tp-final-repo/fastapi-tp:vN \
+  --project tp-final-adtech-493922
+
+gcloud run deploy fastapi-tp \
+  --image us-central1-docker.pkg.dev/tp-final-adtech-493922/tp-final-repo/fastapi-tp:vN \
+  --region us-central1 \
+  --project tp-final-adtech-493922 \
+  --set-env-vars 'POSTGRES_URI=postgresql+psycopg2://USER:PASS@34.46.239.72:5432/recos_db'
+```
+
+> El bloque `--set-env-vars` debe ir entre comillas simples para que el shell no se coma los caracteres especiales del password URL-encoded.
+
+### 4. Verificación
+
+```bash
+curl -s https://fastapi-tp-xbo6kajhza-uc.a.run.app/health
+# {"status":"ok"}
+```
+
+---
+
+## Tecnologías utilizadas
+
+- **Python 3.12** — pandas, psycopg2, FastAPI, uvicorn
+- **Apache Airflow** (LocalExecutor, sobre VM e2-small)
+- **PostgreSQL 18** (Cloud SQL administrado)
+- **Docker** + **Cloud Build** + **Artifact Registry**
+- **Cloud Run** (serverless containers)
+- **Google Cloud Storage** (data lake de CSVs)
+
+---
+
+## Notas de versionado
+
+| Componente | Versión actual | Notas |
+|---|---|---|
+| API (Cloud Run) | `fastapi-tp:v3` | Migración al schema normalizado (2026-05-09) |
+| DAG | `adtech_pipeline_v2_gcs` | Lectura directa de GCS, upsert con ON CONFLICT |
+| Schema SQL | normalizado | Ver `sql/schema.sql` |
+
+Para detalle de cambios y problemas resueltos, ver [`docs/INFORME_FINAL.md`](docs/INFORME_FINAL.md) (secciones 7 y 8).
