@@ -227,7 +227,7 @@ for r in rows:
 # Por cada advertiser, |ctr ∩ prod| / |ctr ∪ prod|
 ```
 
-Es importante aclarar que el pipeline batch sí utiliza SQLAlchemy de manera indirecta, a través de la sesión que abre el DAG para hacer el upsert. Esto introduce una asimetría respecto de la API, que utiliza `psycopg2` de forma directa. Esta diferencia responde principalmente a decisiones tomadas durante las primeras etapas del desarrollo del proyecto. Una posible mejora futura consistiría en unificar ambos componentes bajo una misma estrategia de acceso a datos para mantener mayor consistencia en la arquitectura. Debido a restricciones de tiempo, se decidió mantener la implementación actual.
+El pipeline batch (DAG) también utiliza `psycopg2` directo, mediante el helper `psycopg2.extras.execute_values` que permite enviar un `INSERT` masivo con `ON CONFLICT` en una sola query. La asimetría menor que persiste es de configuración: el DAG lee las credenciales de variables de entorno separadas (`RECOS_DB_HOST`, `RECOS_DB_USER`, `RECOS_DB_PASSWORD`, `RECOS_DB_NAME`) mientras que la API consume una única `POSTGRES_URI`. Ambos terminan conectándose con el mismo driver al mismo Postgres.
 
 #### Empaquetado y despliegue
 
@@ -376,9 +376,11 @@ La primera versión del sistema utilizaba dos tablas separadas (`top_ctr` y `top
 
 La versión final migra a un esquema normalizado (`recommendations` con una fila por producto) y al patrón de upsert con `ON CONFLICT`. El DAG ahora identifica filas existentes por su clave natural `(advertiser_id, model, product_id, date)` y las actualiza o inserta según corresponda. Las queries de la API se simplificaron: dejaron de necesitar parseo de strings y pasaron a ser SELECT convencionales.
 
-### 7.3 psycopg2 directo en la API, SQLAlchemy en el DAG
+### 7.3 Acceso a Postgres con `psycopg2` directo en API y DAG
 
-La API usa `psycopg2` directo. El DAG usa SQLAlchemy para la conexión, principalmente porque la primera implementación se basaba en `pandas.to_sql` (que requiere un engine de SQLAlchemy). Una vez identificada esta asimetría, se evaluó unificar ambos componentes pero se decidió mantener la implementación actual para evitar riesgos de regresión cerca del cierre del proyecto. Una mejora futura consistiría en unificar todo bajo `psycopg2` directo o, alternativamente, bajo SQLAlchemy.
+Tanto la API como el DAG se conectan a Postgres usando `psycopg2` directamente, sin ORM ni capas adicionales. Las operaciones del proyecto son simples (lecturas con SELECT en la API, un INSERT bulk con upsert en el DAG), por lo que un ORM solo agregaría complejidad sin valor proporcional.
+
+Como anécdota: la primera versión del DAG escribía a Postgres con `pandas.to_sql(..., if_exists='replace')`, lo cual implicaba arrastrar SQLAlchemy como dependencia indirecta y reemplazar las tablas enteras en cada corrida. Cuando migramos al esquema normalizado tuvimos que reescribir esa parte porque `to_sql` no soporta `ON CONFLICT`, y necesitábamos upsert real para acumular histórico. La nueva implementación usa `psycopg2.extras.execute_values`, que permite hacer un INSERT bulk con `ON CONFLICT` en una sola query, y como bonus eliminó SQLAlchemy del lado del DAG. Hoy el sistema es consistente: el mismo driver en los dos componentes.
 
 ### 7.4 Cloud Run en lugar de una VM dedicada para la API
 
@@ -480,7 +482,7 @@ Si bien el sistema cumple con los objetivos planteados, existen diversas áreas 
 
 - **TopCTR sin filtro de impresiones mínimas.** El modelo no descarta productos con pocas impresiones. Un producto con 2 impresiones y 2 clicks tiene CTR = 1.0 y puede ganar el ranking. La mejora directa sería agregar un filtro tipo `impressions_count >= N` (por ejemplo `N = 10`) antes de calcular el ranking, o aplicar un suavizado bayesiano (Wilson score, smoothing tipo Laplace) para penalizar las observaciones de bajo volumen.
 
-- **Asimetría DAG / API en el acceso a datos.** El DAG usa SQLAlchemy y la API `psycopg2` directo. Una mejora prolija sería unificar ambos componentes bajo una sola estrategia.
+- **Configuración de conexión asimétrica entre DAG y API.** Ambos usan `psycopg2`, pero el DAG lee las credenciales de cuatro variables de entorno separadas (`RECOS_DB_HOST`, `RECOS_DB_USER`, `RECOS_DB_PASSWORD`, `RECOS_DB_NAME`) mientras que la API consume una única `POSTGRES_URI`. Una mejora menor sería unificar el formato de configuración entre ambos.
 
 - **Tests automatizados.** La API y el DAG no tienen tests unitarios ni de integración. En un sistema de producción real escribiríamos tests con `pytest` para cada endpoint y para el flujo de transformación. Los validamos manualmente con `curl`, pero no es lo mismo.
 
