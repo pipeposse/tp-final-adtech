@@ -130,7 +130,7 @@ El DAG actual se llama `adtech_pipeline_v2_gcs`. Vale aclararlo porque durante e
 
 Las cuatro tareas con sus dependencias quedaron de la siguiente manera: `FiltrarDatos` primero, después `TopCTR` y `TopProduct` en paralelo, y al final `DBWriting` que junta los resultados. La fecha que procesa cada run viene en el contexto de Airflow como `ds`, y el código usa esa fecha para construir el nombre de los archivos a leer (por ejemplo `ads_views_2026-04-19.csv`).
 
-La interfaz web de Apache Airflow se encuentra expuesta en el puerto 8080 de la máquina virtual. Con el objetivo de permitir la inspección del sistema sin comprometer su operación, se creó un usuario adicional con permisos de tipo *Viewer* (solo lectura). Este usuario puede visualizar los DAGs y sus ejecuciones, pero no posee permisos para disparar tareas manualmente, pausar pipelines ni modificar configuraciones.
+La interfaz web de Apache Airflow se encuentra expuesta en el puerto 8080 de la máquina virtual. Con el objetivo de permitir la inspección del sistema sin comprometer su operación, se creó un usuario adicional con permisos de Admin. Este usuario puede visualizar los DAGs y sus ejecuciones, pero no posee permisos para disparar tareas manualmente, pausar pipelines ni modificar configuraciones.
 
 ### 4.3 Cloud SQL: la base de datos
 
@@ -627,7 +627,7 @@ El resultado final es un proyecto que puede comprenderse integralmente, desde la
 | Airflow UI | http://34.55.205.251:8080 |
 | Repositorio Git | https://github.com/pipeposse/tp-final-adtech |
 
-**Credenciales de Airflow para evaluación (rol Viewer, solo lectura):**
+**Credenciales de Airflow para evaluación (rol Admin):**
 
 - Usuario: `profesor`
 - Password: `profesor`
