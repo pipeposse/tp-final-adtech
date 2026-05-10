@@ -1,6 +1,6 @@
 # Pipeline de Recomendaciones AdTech
 
-**Trabajo Práctico Final · Programación Avanzada**
+**Trabajo Práctico Final · Programación Avanzada para Grandes Volúmenes de Datos**
 Universidad de San Andrés
 
 **Autores:** Felipe Posse · Diego Sanguinetti · Belén Candela Lozada Montanari
@@ -52,7 +52,7 @@ La construcción de este tipo de pipeline integra varios conceptos que habitualm
 - Diseñar y desplegar un pipeline completo en Google Cloud, desde el archivo crudo hasta una API pública.
 - Orquestar el procesamiento diario con Apache Airflow, de manera que cada paso quede registrado y, si falla, se pueda reintentar sin tener que hacer todo de cero.
 - Implementar los dos modelos pedidos (TopCTR y TopProduct) y, ya que estábamos, agregar un análisis de cuánto se parecen entre ellos.
-- Construir una API REST en FastAPI que cumpla los endpoints de la consigna, valide los inputs (rechace cosas raras antes de llegar a la base) y use códigos HTTP correctos (200 para todo bien, 400 si te equivocás vos, 404 si no existe, 500 si nos rompimos nosotros).
+- Construir una API REST en FastAPI que cumpla los endpoints de la consigna, valide los inputs (rechace cosas raras antes de llegar a la base) y use códigos HTTP correctos (200 para todo bien, 400 si te equivocás vos, 404 si no existe, 500 si por algún ajuste rompimos algo).
 - Empaquetar la API en Docker y desplegarla en Cloud Run con tags versionados.
 
 ### 2.3 Alcance y estado final de implementación
@@ -60,8 +60,6 @@ La construcción de este tipo de pipeline integra varios conceptos que habitualm
 El sistema procesa tres datasets de entrada por día: `active_advertisers` (los anunciantes que están "activos"), `ads_views` (impresiones y clicks del día), y `product_views` (visualizaciones de productos en el sitio). La salida es la tabla `recommendations` en la base, con las veinte mejores recomendaciones por advertiser y por modelo. La API expone consultas individuales, históricas y de estadísticas.
 
 El proyecto pasó por dos iteraciones mayores durante el desarrollo. Una primera versión utilizaba un esquema "denormalizado" con dos tablas separadas (`top_ctr` y `top_product`) y los productos guardados como lista serializada en una columna TEXT. La versión final, deployada el 2026-05-09, migró a un esquema normalizado con una sola tabla `recommendations` (una fila por producto) y upsert con `ON CONFLICT`, lo que habilita histórico real de recomendaciones y queries SQL convencionales. Ambas mejoras se documentan en las secciones 4, 7 y 8.
-
-Quedan algunas decisiones que no se pudieron terminar de desarrollar y que se documentan en la sección 9 como "Limitaciones Actuales y Trabajo Futuro": no tenemos tests automatizados, el scheduler de Airflow corre con un truco rústico (`nohup`) en lugar de un servicio prolijo de Linux, y el modelo TopCTR no descarta productos con muy pocas impresiones (que pueden tener un CTR engañosamente alto por la muestra chica).
 
 ---
 
@@ -79,7 +77,7 @@ Compute Engine VM (e2-small, una maquina virtual chica en us-central1-a)
    |-- Apache Airflow (LocalExecutor, que corre todo en la misma VM)
        |-- scheduler (el que decide cuando dispara el DAG)
        |-- webserver (la UI web en el puerto 8080)
-       |-- DAG adtech_pipeline_v2_gcs (corre todos los dias 02:00 UTC)
+       |-- DAG adtech_pipeline_v2_gcs (corre todos los dias 02:00 UTC, es la segunda versión que deployamos)
            |-- FiltrarDatos
            |-- TopCTR
            |-- TopProduct
@@ -89,14 +87,14 @@ Compute Engine VM (e2-small, una maquina virtual chica en us-central1-a)
 Cloud SQL (PostgreSQL 18 administrado por Google)
    |-- airflow_db (donde Airflow guarda su propia metadata)
    |-- recos_db
-       |-- recommendations (una fila por (advertiser, modelo, producto, dia))
+       |-- recommendations (una fila por (advertiser, modelo, producto, dia, tambíen nuevo modelo)
        |-- api_logs (registro de cada consulta a la API)
    ^
    |
 Cloud Run (la API FastAPI, dentro de una imagen Docker fastapi-tp:vN)
    |
    v
-Cliente HTTP (el corrector, nosotros, o cualquiera con la URL)
+Cliente HTTP ( nosotros, o cualquiera con la URL)
 ```
 
 ### 3.2 El recorrido del dato, de punta a punta
@@ -113,27 +111,22 @@ Por otro lado, totalmente desacoplado, el servicio FastAPI en Cloud Run consulta
 
 ### 4.1 Cloud Storage: dónde caen los archivos
 
-Los archivos CSV crudos se almacenan en un bucket de Google Cloud Storage (GCS), el servicio de almacenamiento de objetos de Google Cloud. Este tipo de almacenamiento resulta adecuado para datos semiestructurados como archivos CSV, ya que permite manejar grandes volúmenes de información a bajo costo, cobrando principalmente por almacenamiento y transferencia de datos. Además, desacopla el almacenamiento de archivos del sistema transaccional utilizado para consultas y procesamiento.
-
+Los archivos CSV crudos se almacenan en un bucket de Google Cloud Storage (GCS), el servicio de almacenamiento de objetos de Google Cloud. Este tipo de almacenamiento resulta adecuado para datos semiestructurados como archivos CSV.
 Los archivos siguen un patrón de nombres por fecha:
 
 - `active_advertisers.csv` (la lista de anunciantes vivos, no cambia por dia).
 - `ads_views_YYYY-MM-DD.csv` (impresiones y clicks del dia).
 - `product_views_YYYY-MM-DD.csv` (visualizaciones de productos del dia).
 
-Se eligió utilizar Google Cloud Storage en lugar de cargar los datos directamente en Cloud SQL debido a su menor costo, mayor capacidad de escalabilidad y mejor desacoplamiento respecto del resto de la arquitectura. Este enfoque permite reprocesar los archivos originales ante errores o cambios en la lógica de procesamiento sin modificar el contenido de la base de datos.
 
 ### 4.2 Apache Airflow: el orquestador
 
 Airflow corre sobre una máquina virtual `e2-small` en `us-central1-a` de Compute Engine. Un orquestador es un programa que decide qué tarea correr, en qué orden, y qué hacer si una falla. Sin un orquestador, el sistema dependería de scripts ejecutados mediante tareas programadas tradicionales, lo que dificulta el monitoreo, el manejo de errores y la recuperación ante fallos. El uso de Apache Airflow permite centralizar la ejecución, trazabilidad y reintento de las tareas del pipeline.
 
-En esta etapa se tomó una decisión de arquitectura relevante. Google Cloud ofrece una versión administrada de Apache Airflow denominada Cloud Composer, que representa la alternativa más robusta desde el punto de vista operativo. Sin embargo, debido a su costo fijo mensual relativamente elevado para el contexto de un trabajo práctico, se optó por desplegar Airflow manualmente sobre una máquina virtual en Compute Engine.
-
-La principal desventaja de esta decisión es que el mantenimiento operativo queda completamente a cargo del equipo. Por ejemplo, si la máquina virtual se reinicia, es necesario volver a levantar manualmente los servicios correspondientes, y cualquier problema relacionado con la metadata interna de Airflow debe resolverse de manera directa. En un entorno de producción de gran escala, Cloud Composer probablemente justificaría su costo debido a la reducción de tareas operativas y de mantenimiento. Para el alcance de este proyecto, se priorizó minimizar costos y mantener un mayor control sobre la infraestructura.
-
+La principal desventaja de esta decisión es que el mantenimiento operativo queda completamente a cargo del equipo. Por ejemplo, si la máquina virtual se reinicia, es necesario volver a levantar manualmente los servicios correspondientes, y cualquier problema relacionado con la metadata interna de Airflow debe resolverse de manera directa.
 La instalación de Airflow se realizó dentro de un entorno virtual de Python (venv) ubicado en `/home/pipeposse/airflow_venv`, lo que permite aislar las dependencias del proyecto respecto del resto del sistema. La metadata interna de Airflow —incluyendo información sobre DAGs, ejecuciones y logs de tareas— se almacena en una base de datos PostgreSQL denominada `airflow_db`, alojada en la instancia de Cloud SQL del proyecto.
 
-El DAG actual se llama `adtech_pipeline_v2_gcs`. Vale aclararlo porque durante el desarrollo lo llamamos sucesivamente `adtech_recos`, `adtech_pipeline` y finalmente `adtech_pipeline_v2_gcs` (el sufijo `_v2_gcs` marca la migración a lectura directa desde Cloud Storage). Si aparecen referencias viejas a `adtech_recos` o `adtech_pipeline` en notas internas, son artefactos del desarrollo. El nombre vivo es `adtech_pipeline_v2_gcs`.
+El DAG actual se llama `adtech_pipeline_v2_gcs`. Vale aclararlo porque durante el desarrollo lo llamamos sucesivamente `adtech_recos`, `adtech_pipeline` y finalmente `adtech_pipeline_v2_gcs` (el sufijo `_v2_gcs` marca la migración a lectura directa desde Cloud Storage). Si aparecen referencias viejas a `adtech_recos` o `adtech_pipeline` en notas internas, son artefactos del desarrollo. El nombre vivo es `adtech_pipeline_v2_gcs`. Al principio los archivos vivían en la virtual machine, cuando vimos que todo funcionaba bien hicimos la mudanza a GSC.
 
 Las cuatro tareas con sus dependencias quedaron de la siguiente manera: `FiltrarDatos` primero, después `TopCTR` y `TopProduct` en paralelo, y al final `DBWriting` que junta los resultados. La fecha que procesa cada run viene en el contexto de Airflow como `ds`, y el código usa esa fecha para construir el nombre de los archivos a leer (por ejemplo `ads_views_2026-04-19.csv`).
 
@@ -172,12 +165,12 @@ CREATE TABLE api_logs (
     timestamp     TIMESTAMP DEFAULT NOW()
 );
 ```
+##La mejora
+La tabla `recommendations` es **normalizada**: una fila por (advertiser, modelo, producto, día). Esto permite hacer queries SQL convencionales (filtrar, ordenar, contar, indexar) sobre cada producto individual, en lugar de tener que parsear strings serializados en el cliente. Eséticamente termino siendo un cambio muy beneficioso.
 
-La tabla `recommendations` es **normalizada**: una fila por (advertiser, modelo, producto, día). Esto permite hacer queries SQL convencionales (filtrar, ordenar, contar, indexar) sobre cada producto individual, en lugar de tener que parsear strings serializados en el cliente.
+El índice único `uq_recommendations_natural_key` es necesario para que la operación de upsert del DAG (`INSERT ... ON CONFLICT (advertiser_id, model, product_id, date)`) funcione: PostgreSQL exige un constraint único o un índice único sobre exactamente esas columnas para resolver el conflicto. Gracias a este diseño, el DAG puede correr el mismo día más de una vez (por ejemplo, en caso de reintento) sin duplicar filas: encuentra la combinación existente por la clave natural y actualiza el `rank`, `score` y `created_at`. (Nos costó mucho entender porque no funcionaba sin el index)
 
-El índice único `uq_recommendations_natural_key` es necesario para que la operación de upsert del DAG (`INSERT ... ON CONFLICT (advertiser_id, model, product_id, date)`) funcione: PostgreSQL exige un constraint único o un índice único sobre exactamente esas columnas para resolver el conflicto. Gracias a este diseño, el DAG puede correr el mismo día más de una vez (por ejemplo, en caso de reintento) sin duplicar filas: encuentra la combinación existente por la clave natural y actualiza el `rank`, `score` y `created_at`.
-
-La tabla `api_logs` la crea la API automáticamente al arrancar (en una función de inicialización llamada `lifespan`, que corre una sola vez cuando el container arranca). Registra cada consulta exitosa de recomendaciones, lo cual alimenta el endpoint `/stats/`.
+La tabla `api_logs` la crea la API automáticamente al arrancar (en una función de inicialización llamada `lifespan`, que corre una sola vez cuando el container arranca). Registra cada consulta exitosa de recomendaciones, lo cual alimenta el endpoint `/stats/`. Además crel la tabla si no esta creada.
 
 > **Nota histórica.** Una versión anterior del schema utilizaba dos tablas (`top_ctr` y `top_product`) con una columna TEXT que guardaba la lista de los 20 productos serializada como literal Python (`"['p1', 'p2', ...]"`). Esa decisión simplificaba las queries pero introducía un anti-patrón relacional: era imposible filtrar, ordenar o contar productos individuales sin parsear strings en el cliente. La migración al esquema normalizado se realizó el 2026-05-09 junto con el redeploy de la API a su versión 3 (ver secciones 7 y 8). Las tablas viejas fueron dropeadas tras confirmar que ningún cliente seguía consultándolas.
 
@@ -185,15 +178,33 @@ La tabla `api_logs` la crea la API automáticamente al arrancar (en una función
 
 La API fue desarrollada utilizando FastAPI 0.115, un framework de Python orientado a la construcción de APIs web. FastAPI permite definir endpoints HTTP a partir de funciones estándar de Python mediante el uso de decoradores como `@app.get(...)`. Además, genera automáticamente documentación interactiva de la API, accesible a través del endpoint `/docs`.
 
-Para servir las peticiones por HTTP, FastAPI necesita un servidor (no es un servidor por sí mismo, es solo el framework). Usamos Uvicorn en su versión "standard", que viene con dependencias adicionales que mejoran la performance.
+Para servir las peticiones por HTTP, FastAPI necesita un servidor (no es un servidor por sí mismo, es solo el framework). Usamos Uvicorn en su versión "standard", que viene con dependencias adicionales que mejoran la performance. FastAPI sin Uvicorn es una API escrita, pero no encendida para recibir consultas.
 
 La API se conecta a PostgreSQL utilizando `psycopg2-binary` de manera directa, sin capas adicionales de abstracción. `psycopg2` es el driver de PostgreSQL para Python y permite establecer la comunicación entre la aplicación y la base de datos.
 
 En este proyecto se decidió no utilizar un ORM (*Object Relational Mapper*), es decir, una capa que abstrae las consultas SQL mediante objetos de Python. Dado que las operaciones requeridas por la API son relativamente simples —principalmente consultas SELECT y registros INSERT—, se priorizó una implementación más liviana y con consultas SQL explícitas, facilitando la lectura y el control del código.
 
+Un ejempollo de ORM:
+
+class Recommendation(Base):
+    __tablename__ = "recommendations"
+
+    id = Column(Integer, primary_key=True)
+    advertiser_id = Column(Integer)
+    model_name = Column(String)
+    product_id = Column(Integer)
+    date = Column(Date)
+    score = Column(Float)
+
+    recommendations = session.query(Recommendation).filter(
+    Recommendation.advertiser_id == advertiser_id
+).all()
+
+Como se la estructura es mucho mas compleja y pierde interpretabilidad.
+
 #### Filosofía de las queries SQL
 
-El nuevo `main.py` (versión `:v3`, deploy 2026-05-09) sigue una filosofía simple: **cada query debe poder explicarse en una oración**. No hay CTEs ni JOINs explícitos; la única "sofisticación" es una subquery escalar en `/stats` que devuelve la fecha más reciente. La lógica de matemática de sets (intersección, unión para Jaccard) vive en Python, donde es más legible.
+El nuevo `main.py` (versión `:v3`, deploy 2026-05-09) sigue una filosofía simple: **cada query debe poder explicarse en una oración**. No hay CTEs ni JOINs explícitos; la única "sofisticación" es una subquery escalar en `/stats` que devuelve la fecha más reciente. La lógica de matemática de sets (intersección, unión para Jaccard) vive en Python, donde es más legible. Realmente buscamos que las queries se puedan entender a simple vista.
 
 Las queries fundamentales de cada endpoint son:
 
@@ -335,17 +346,19 @@ Cloud Build agarra la carpeta `api/`, la sube a un bucket temporal, levanta una 
 
 ### 6.3 Versionado de imágenes y rollback
 
-Cada deploy se realizó con un tag explícito (`v1`, `v2`, `v3`) en lugar del tag `:latest`, que sería el default. Esto agrega trabajo manual mínimo (acordarse de incrementar el número), pero a cambio provee información importante: si una versión nueva trae bugs, se puede volver a la anterior con un solo deploy, porque la imagen anterior sigue viva en Artifact Registry. A esto se le llama *rollback*.
+Cada deploy se realizó con un tag explícito (`v1`, `v2`, `v3`) en lugar del tag `:latest`, que sería el default. Esto agrega trabajo manual mínimo (acordarse de incrementar el número), pero a cambio provee información importante: si una versión nueva trae bugs, se puede volver a la anterior con un solo deploy, porque la imagen anterior sigue viva en Artifact Registry. A esto vimos que se le llama *rollback*.
 
 Cloud Run también guarda un historial de revisiones del servicio. Eso permite, si se quisiera, dividir el tráfico entre revisiones (lo que se llama *canary deployment*: "mandá el 90% del tráfico a la versión vieja y el 10% a la nueva, así si algo se rompe afecta a poca gente"). Si bien este enfoque no fue implementado en el presente trabajo práctico, resulta relevante mencionarlo como una posible alternativa o extensión futura del sistema.
 
 ### 6.4 Variables de entorno y manejo de secretos
 
-La conexión a Cloud SQL se configuró mediante una variable de entorno llamada `POSTGRES_URI`, definida directamente en el servicio de Cloud Run. Una variable de entorno es un valor de configuración que se le pasa a una aplicación por fuera del código fuente. Esto permite desacoplar información sensible, como credenciales o direcciones de conexión, evitando que queden escritas directamente dentro de la aplicación.
+Para que la API y el DAG puedan conectarse a Postgres necesitan saber la dirección del servidor, el usuario y el password. En vez de dejar esos datos escritos en el código (lo cual sería un riesgo de seguridad y una incomodidad para cambiar el password después), los pasamos como variables de entorno: valores que la aplicación lee al arrancar y que viven afuera del repositorio.
 
-Esto sigue el principio de Twelve-Factor App, un conjunto de buenas prácticas para aplicaciones modernas que recomienda manejar la configuración mediante variables de entorno y no directamente en el código. En el repositorio se incluye además un archivo `.env.example` que muestra el formato esperado, utilizando un placeholder como `TU_PASSWORD` en lugar de credenciales reales. De esta manera, cualquier persona que clone el repositorio puede entender qué variables necesita configurar sin exponer información sensible.
+Acá quedó una asimetría que vale la pena admitir: cada componente terminó leyendo las credenciales de un lugar distinto. La API, que corre en Cloud Run, usa una sola variable llamada `POSTGRES_URI` que contiene toda la string de conexión armada (host, puerto, usuario, password, nombre de base). Esa variable la inyectamos en Cloud Run al momento del deploy con el flag `--set-env-vars`. El DAG, que corre en la VM de Airflow, usa cuatro variables separadas (`RECOS_DB_HOST`, `RECOS_DB_USER`, `RECOS_DB_PASSWORD`, `RECOS_DB_NAME`) que dejamos en el `~/.bashrc` del usuario `pipeposse`. Las dos formas funcionan, pero idealmente habríamos unificado el formato. La razón de que estén distintas es histórica: cada componente lo armamos en momentos distintos del desarrollo y cada uno quedó con la convención que le había salido más natural.
 
-La API tiene una mini capa que normaliza la URI antes de usarla. Si llega con un prefijo extendido del estilo `postgresql+psycopg2://`, la traduce al formato libpq estándar (`postgresql://`) que es el que entiende `psycopg2` directamente. Esta adaptación se implementó luego de detectar que la variable de entorno configurada en Cloud Run utilizaba el prefijo extendido, lo que provocaba errores durante el arranque de la API. El problema y su resolución se describen con mayor detalle en la sección 8.
+En el repositorio dejamos también un archivo `.env.example` con los nombres de las variables y valores ficticios (por ejemplo `TU_PASSWORD` en lugar del password real). La idea es que cualquier persona que clone el proyecto pueda ver de un vistazo qué credenciales necesita configurar para levantarlo, sin que las credenciales reales aparezcan en el código.
+
+Hay un detalle más, que es producto de un problema real con el que nos chocamos. La API tiene una línea al arrancar que normaliza la URI antes de pasársela a `psycopg2`. Resulta que existen dos formas de escribir esa URI: la "extendida" (`postgresql+psycopg2://...`), que algunas librerías esperan, y la "limpia" (`postgresql://...`), que es la que `psycopg2` entiende directamente. Si le pasás la extendida, falla al arrancar. Como en algún momento la variable había quedado seteada con el prefijo largo, en lugar de andar tocando la configuración de Cloud Run cada vez, agregamos una línea que reemplaza un prefijo por el otro. Es un parche más que una solución elegante, pero funciona y nos sacó del problema. La historia completa está en la sección 8.
 
 ### 6.5 Networking: la IP estática y el firewall
 
@@ -353,8 +366,7 @@ La VM de Airflow tiene una IP externa estática (`34.55.205.251`), reservada com
 
 La regla de firewall `allow-airflow-ui` permite tráfico entrante TCP en el puerto 8080 desde cualquier origen (`0.0.0.0/0`). Suena medio permisivo, pero es aceptable porque Airflow tiene su propia autenticación con usuario y password: aunque cualquiera llegue al puerto, sin login no entra.
 
-La API en Cloud Run, por su parte, se expone a través de una URL HTTPS estable que provee la plataforma. No tuvimos que gestionar certificados SSL, IPs externas ni balanceadores de carga: todo eso lo hace Cloud Run debajo. Una de las ventajas de un serverless administrado.
-
+La API en Cloud Run, por su parte, se expone a través de una URL HTTPS estable que provee la plataforma. 
 ---
 
 ## 7. Decisiones tomadas durante el desarrollo
@@ -376,6 +388,67 @@ La primera versión del sistema utilizaba dos tablas separadas (`top_ctr` y `top
 
 La versión final migra a un esquema normalizado (`recommendations` con una fila por producto) y al patrón de upsert con `ON CONFLICT`. El DAG ahora identifica filas existentes por su clave natural `(advertiser_id, model, product_id, date)` y las actualiza o inserta según corresponda. Las queries de la API se simplificaron: dejaron de necesitar parseo de strings y pasaron a ser SELECT convencionales.
 
+
+
+#### Cómo funciona `ON CONFLICT`, con un ejemplo 
+
+Vamos a verlo con la tabla `recommendations` en mano. Supongamos que ya tiene estas tres filas, resultado de una corrida del DAG el 2026-05-09:
+
+| advertiser_id | model     | product_id | rank | score | date       |
+|---------------|-----------|------------|------|-------|------------|
+| ADV1          | top_ctr   | prod42     | 5    | 0.10  | 2026-05-09 |
+| ADV1          | top_ctr   | prod88     | 6    | 0.09  | 2026-05-09 |
+| ADV2          | top_ctr   | prodX      | 1    | 0.42  | 2026-05-09 |
+
+A la tarde, nos damos cuenta de que el CSV de `ADV1` había llegado con un click faltante. Reprocesamos el día. El DAG vuelve a calcular y ahora `prod42` para `ADV1` tiene `rank=3, score=0.18`. Y descubrimos también un producto nuevo, `prod99`, que no estaba antes (`rank=12, score=0.05`).
+
+Sin `ON CONFLICT`, esto sería un drama: el primer INSERT (el de `prod42`) chocaría con la fila vieja y la base devolvería un error de "duplicate key", abortando la transacción. Tendríamos que primero borrar lo viejo, después insertar lo nuevo, y rezar para que nadie consulte la API en el medio.
+
+Con `ON CONFLICT`, en cambio, mandamos un único INSERT por fila y le decimos a Postgres qué hacer si choca:
+
+```sql
+-- Reemplazo: prod42 ya existía con rank=5, lo actualizamos a rank=3.
+INSERT INTO recommendations (advertiser_id, model, product_id, rank, score, date)
+VALUES ('ADV1', 'top_ctr', 'prod42', 3, 0.18, '2026-05-09')
+ON CONFLICT (advertiser_id, model, product_id, date)
+DO UPDATE SET rank = EXCLUDED.rank, score = EXCLUDED.score;
+
+-- Inserción limpia: prod99 no existía, entra como fila nueva.
+INSERT INTO recommendations (advertiser_id, model, product_id, rank, score, date)
+VALUES ('ADV1', 'top_ctr', 'prod99', 12, 0.05, '2026-05-09')
+ON CONFLICT (advertiser_id, model, product_id, date)
+DO UPDATE SET rank = EXCLUDED.rank, score = EXCLUDED.score;
+```
+
+La tabla queda así:
+
+| advertiser_id | model     | product_id | rank      | score      | date       | Qué pasó      |
+|---------------|-----------|------------|-----------|------------|------------|---------------|
+| ADV1          | top_ctr   | prod42     | **3**     | **0.18**   | 2026-05-09 | UPDATE        |
+| ADV1          | top_ctr   | prod88     | 6         | 0.09       | 2026-05-09 | (sin cambios) |
+| ADV2          | top_ctr   | prodX      | 1         | 0.42       | 2026-05-09 | (sin cambios) |
+| **ADV1**      | **top_ctr** | **prod99** | **12**  | **0.05**   | **2026-05-09** | INSERT    |
+
+Tres ideas clave de este ejemplo:
+
+1. **La "firma" de cada fila** son las cuatro columnas que aparecen entre paréntesis después de `ON CONFLICT`: `(advertiser_id, model, product_id, date)`. Postgres las usa para decidir si lo que entra ya estaba o no.
+2. **La pseudo-tabla `EXCLUDED`** representa la fila que estábamos intentando insertar. Cuando hay conflicto, accedemos a sus valores con `EXCLUDED.rank`, `EXCLUDED.score`, etc. para sobrescribir las columnas existentes.
+3. **`prod88` quedó intacto.** `ON CONFLICT` no es un "DELETE + reinsert". Solo toca las filas que efectivamente colisionan; el resto del estado de la tabla queda como estaba. Eso es lo que nos permite acumular histórico de varios días en la misma tabla sin pisarnos.
+
+#### Cómo llegamos a esta solución
+
+La elección de `ON CONFLICT` no fue a priori, sino producto de iteración, inistencia y búsqueda de una solucíon más robusta y fructífera. La primera versión del DAG escribía a Postgres con `pandas.to_sql(..., if_exists="replace")`, que reemplazaba la tabla entera en cada corrida. No producía errores, pero tampoco preservaba histórico: el endpoint `/history/` devolvía siempre un único día porque cada corrida pisaba la anterior. Eso nos pareció un picardía, por lo que decidimos a último momento darlo una solución.
+
+Identificada la limitación, evaluamos tres alternativas para "agregar sin pisar":
+
+1. **`SELECT` previo + `UPDATE` o `INSERT`** según existiera la fila. Dos round-trips a Postgres por cada registro y posible *race condition* entre lectura y escritura. Una race condition es cuando dos procesos hacen algo “al mismo tiempo” y el resultado depende de quién llega primero.
+2. **`DELETE WHERE date = ds` + `INSERT` limpio.** Funcional, pero abre una ventana en la que la tabla queda momentáneamente sin las filas del día procesado.
+3. **`INSERT ... ON CONFLICT ... DO UPDATE`,** una única sentencia atómica que resuelve inserción y actualización sin ventanas de inconsistencia. Es el patrón estándar para *upsert* en cualquier motor relacional moderno. Fue una interesante solución, si no existe aplica INSERT, si existe, UPDATE.
+
+La tercera opción era la más limpia. Al implementarla nos encontramos con el error `there is no unique or exclusion constraint matching the ON CONFLICT specification`. Ese mensaje resultó uno de los aprendizajes más valiosos del proyecto: `ON CONFLICT` no opera en abstracto, requiere un índice único físico sobre las columnas declaradas, y es Postgres quien lo utiliza como referencia para detectar el conflicto. Tras crear el índice `uq_recommendations_natural_key`, el DAG completó su ejecución correctamente. Costó un tiempo darnos cuenta de que la solución consistía en ponerle un index a la tabla-
+
+La secuencia "elegir el patrón correcto → leer el error → entender qué espera el motor → proveerlo" sintetiza buena parte del valor pedagógico de la migración: confirmó que los principios del modelo relacional no son convenciones arbitrarias, sino requisitos concretos que sostienen las garantías de consistencia que terminamos aprovechando en el resto del sistema.
+
 ### 7.3 Acceso a Postgres con `psycopg2` directo en API y DAG
 
 Tanto la API como el DAG se conectan a Postgres usando `psycopg2` directamente, sin ORM ni capas adicionales. Las operaciones del proyecto son simples (lecturas con SELECT en la API, un INSERT bulk con upsert en el DAG), por lo que un ORM solo agregaría complejidad sin valor proporcional.
@@ -384,11 +457,14 @@ Como anécdota: la primera versión del DAG escribía a Postgres con `pandas.to_
 
 ### 7.4 Cloud Run en lugar de una VM dedicada para la API
 
-Para desplegar la API también podría haberse utilizado una VM tradicional, pero se eligió Cloud Run por varias ventajas operativas. El servicio ofrece autoscaling automático: si aumenta la cantidad de requests, se levantan más contenedores, y si no hay tráfico puede escalar a cero, evitando costos innecesarios. Además, maneja HTTPS/TLS de forma administrada, sin necesidad de configurar certificados manualmente, y simplifica considerablemente el proceso de deployment. Como contrapartida, Cloud Run introduce latencia de *cold start*: el primer request después de un período de inactividad puede demorar algunos segundos adicionales mientras se inicializa el contenedor. Para la escala esperada en este TP, esa limitación no representa un problema significativo.
+Para desplegar la API teníamos dos caminos: levantar otra VM aparte y correrla ahí, o usar Cloud Run. Elegimos Cloud Run y la diferencia de comodidad fue grande. Una VM hay que prenderla, mantenerla, configurarle un dominio, conseguir un certificado para HTTPS y dejar todo eso funcionando. Cloud Run hace todo eso por vos: vos le dás la imagen Docker y el servicio te devuelve una URL `https://...` que ya está lista para recibir requests, sin que hayamos tocado un certificado en ningún momento.
+
+Otra ventaja concreta es que Cloud Run "escala solo". Si nadie está usando la API, no hay ningún contenedor corriendo y no pagás nada. Si llegan muchos requests al mismo tiempo, levanta más contenedores automáticamente. En una VM tendríamos que dimensionarla a ojo y, o nos quedaba chica si entraba un pico, o nos quedaba grande pagando de más.
+
 
 ### 7.5 Versionar imágenes Docker con vN en vez de :latest
 
-Las imágenes Docker las subimos a Artifact Registry con tags explícitos (`v1`, `v2`, `v3`) en lugar de pisar siempre `:latest`, que sería el default. Esto agrega trabajo manual mínimo, pero a cambio nos da rollback inmediato si una versión nueva trae bugs: la imagen anterior sigue ahí, basta con redeployarla. Si pisáramos `:latest` todo el tiempo, perderíamos esa red de seguridad.
+Las imágenes Docker las subimos a Artifact Registry con tags explícitos (`v1`, `v2`, `v3`) en lugar de pisar siempre `:latest`, que sería el default. Esto agrega trabajo manual mínimo, pero a cambio nos da la posibilidad inmediata para volver para atrás.
 
 ---
 
@@ -433,6 +509,8 @@ La variable estaba en `.bashrc`, sí. El tema es que `.bashrc` solo lo lee una s
 
 La solución fue matar todos los procesos viejos, abrir una shell limpia que cargara `.bashrc` (haciendo `source ~/.bashrc`), y volver a arrancar el scheduler y el webserver con `nohup`. Para una solución más definitiva habría que crear unidades systemd con la variable definida en el archivo `.service`, pero por tiempo lo dejamos para una mejora futura.
 
+Una vez más, el orden de como se ejecutan los procesos terminó siendo crítico. 
+
 ### 8.3 La memoria del proyecto que tenía un nombre de DAG equivocado
 
 Mientras debugueábamos el problema anterior, intentamos verificar los runs históricos del DAG con:
@@ -446,6 +524,7 @@ Y nos devolvía vacío. Pensábamos que el DAG estaba sin runs, pero el problema
 Es un problema chiquito pero ilustra algo importante: los nombres son contratos. Si el `dag_id` en el código no matchea con lo que esperan los comandos o la documentación, todo se rompe. La lección fue revisar siempre el código fuente como fuente de verdad, no las notas viejas.
 
 ### 8.4 ON CONFLICT contra una tabla sin índice único
+
 
 **Síntoma:** una vez migrado al modelo normalizado, el DAG empezó a fallar en el último task con un error específico:
 
@@ -484,9 +563,32 @@ Si bien el sistema cumple con los objetivos planteados, existen diversas áreas 
 
 - **Configuración de conexión asimétrica entre DAG y API.** Ambos usan `psycopg2`, pero el DAG lee las credenciales de cuatro variables de entorno separadas (`RECOS_DB_HOST`, `RECOS_DB_USER`, `RECOS_DB_PASSWORD`, `RECOS_DB_NAME`) mientras que la API consume una única `POSTGRES_URI`. Una mejora menor sería unificar el formato de configuración entre ambos.
 
-- **Tests automatizados.** La API y el DAG no tienen tests unitarios ni de integración. En un sistema de producción real escribiríamos tests con `pytest` para cada endpoint y para el flujo de transformación. Los validamos manualmente con `curl`, pero no es lo mismo.
+El DAG (que corre en la VM de Airflow) tiene 4 variables de entorno separadas, una por cada dato:
 
-- **Lock file de dependencias.** El `requirements.txt` tiene versiones pineadas con `==`, pero no incluye hashes ni las dependencias transitivas explícitas. Una mejora sería usar `pip-compile` o Poetry para generar un lock file completo y reproducible.
+RECOS_DB_HOST=34.46.239.72
+RECOS_DB_USER=tp-user
+RECOS_DB_PASSWORD=*****
+RECOS_DB_NAME=recos_db
+
+Y a la hora de conectar:
+
+psycopg2.connect(host=os.environ["RECOS_DB_HOST"],
+                 user=os.environ["RECOS_DB_USER"],
+                 password=os.environ["RECOS_DB_PASSWORD"],
+                 dbname=os.environ["RECOS_DB_NAME"])
+                 
+
+
+La API (que corre en Cloud Run) tiene una sola variable, con todo armado en una URL:
+POSTGRES_URI=postgresql://tp-user:password@34.46.239.72:5432/recos_db
+
+
+Por qué es una "asimetría"
+Las dos formas funcionan, llegan a la misma base, usan el mismo driver. Pero son dos maneras distintas de decir lo mismo. Si mañana cambia el password de la base, hay que tocarlo en dos lugares con dos formatos distintos: en la VM editás 1 de las 4 variables de entorno; en Cloud Run reemplazás la URL entera con el password nuevo URL-encoded en el medio.
+
+
+
+- **Tests automatizados.** La API y el DAG no tienen tests unitarios ni de integración. En un sistema de producción real escribiríamos tests con `pytest` para cada endpoint y para el flujo de transformación. Los validamos manualmente con `curl`, pero no es lo mismo. No conocemos mucho de este tema, pero sabemos que existe y sumaría mucho en calidad.
 
 - **Conexión a Cloud SQL más segura.** La API se conecta a la base por IP pública. Cloud Run permite conectarse via Cloud SQL Auth Proxy, lo que evita exponer la base por internet.
 
@@ -494,7 +596,7 @@ Si bien el sistema cumple con los objetivos planteados, existen diversas áreas 
 
 - **Autenticación de la API.** Los endpoints son públicos. Para un escenario real habría que poner API keys, OAuth o IAM.
 
-- **Servicio systemd para Airflow.** El scheduler y webserver corren con `nohup`. Lo más prolijo serían archivos `.service` de systemd para que se reinicien al boot de la VM y sobrevivan a reinicios automáticos.
+-- **Auto-arranque del scheduler y webserver de Airflow.** Los dos servicios los lanzamos a mano desde la consola con `nohup` (un comando que deja un programa corriendo en segundo plano aunque cerremos la sesión SSH). El problema es que si la VM se reinicia por cualquier motivo —un mantenimiento de Google, un apagado accidental— el scheduler y el webserver no se vuelven a prender solos: hay que entrar por SSH y levantarlos manualmente. La mejora sería configurarlos como servicios del sistema operativo (lo que Linux llama `systemd`), de modo que arranquen automáticamente cuando se prende la VM. No lo implementamos por tiempo, pero es un cambio relativamente directo cuando se necesite. 
 
 ---
 
@@ -665,4 +767,4 @@ Cualquiera de los siguientes funciona y devuelve resultados:
 
 **Forma alternativa: documentación interactiva**
 
-En lugar de armar las URLs a mano, recomendamos abrir [https://fastapi-tp-xbo6kajhza-uc.a.run.app/docs](https://fastapi-tp-xbo6kajhza-uc.a.run.app/docs) y usar la interfaz Swagger. Cada endpoint tiene un botón "Try it out" que permite escribir los parámetros en formularios y ejecutar la consulta sin tener que pensar la URL.
+En lugar de armar las URLs a mano, recomendamos abrir [https://fastapi-tp-xbo6kajhza-uc.a.run.app/docs](https://fastapi-tp-xbo6kajhza-uc.a.run.app/docs) y usar la interfaz Swagger. Cada endpoint tiene un botón "Try it out" que permite escribir los parámetros en formularios y ejecutar la consulta sin tener que pensar la URL. La verdad, muy cómodo para testear.

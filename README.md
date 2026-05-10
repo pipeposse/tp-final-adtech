@@ -1,6 +1,6 @@
 # TP Final — Pipeline de Recomendaciones AdTech
 
-**Materia:** Programación Avanzada · Universidad de San Andrés · 2026
+**Materia:** Programación Avanzada para Grandes Volúmenes de Datos · Universidad de San Andrés · 2026
 **Autores:** Felipe Posse · Diego Sanguinetti · Belén Candela Lozada Montanari
 **Profesores:** Agustín Mosteiro · Matías Dinota
 **Entrega:** 09/05/2026 · **Coloquio:** 13/05/2026
